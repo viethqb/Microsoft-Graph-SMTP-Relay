@@ -14,6 +14,7 @@ import logging
 
 from event_bus import event_bus_instance
 
+
 def get_attachment_filename(part: Message):
     filename = part.get_filename(part.get_param("name"))
     if filename:
@@ -23,7 +24,7 @@ def get_attachment_filename(part: Message):
     return str(uuid.uuid4())
 
 
-class MicrosoftGraphHandler():
+class MicrosoftGraphHandler:
     """
     An SMTP handler class that processes emails and sends them through the Microsoft Graph API.
 
@@ -32,8 +33,10 @@ class MicrosoftGraphHandler():
 
     Attributes
     ----------
-    app : ConfidentialClientApplication
-        An MSAL Confidential Client Application instance used to acquire tokens for Graph API requests.
+    token_url : str
+        The URL to request tokens from
+    token_data : dict
+        The data needed for token requests
 
     Methods
     -------
@@ -43,14 +46,42 @@ class MicrosoftGraphHandler():
 
     def __init__(self):
         """
-        Initializes the handler with a Confidential Client Application for Microsoft authentication.
+        Initializes the handler with token request configuration.
         """
-        self.app = ConfidentialClientApplication(
-            client_id=os.environ["CLIENT_ID"],
-            client_credential=os.environ["CLIENT_SECRET"],
-            authority=os.environ["AUTHORITY"],
-            token_cache=TokenCache(),
-        )
+        self.token_url = f"https://login.microsoftonline.com/{os.environ['TENANT_ID']}/oauth2/v2.0/token"
+        self.token_data = {
+            "grant_type": "password",
+            "client_id": os.environ["CLIENT_ID"],
+            "client_secret": os.environ["CLIENT_SECRET"],
+            "scope": "https://graph.microsoft.com/.default",
+            "username": os.environ["USERNAME"],
+            "password": os.environ["PASSWORD"],
+        }
+
+    async def _get_access_token(self):
+        """
+        Gets an access token using the password grant flow.
+
+        Returns:
+            str: The access token, or None if failed
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.token_url, data=self.token_data
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data.get("access_token")
+                    else:
+                        error_text = await response.text()
+                        logging.error(
+                            f"Token request failed: {response.status} - {error_text}"
+                        )
+                        return None
+        except Exception as e:
+            logging.error(f"Exception getting token: {e}")
+            return None
 
     @staticmethod
     def _extract_email_address(address: str) -> list:
@@ -79,9 +110,9 @@ class MicrosoftGraphHandler():
         """
 
         attachments = []
-        body = email_message.get_body(preferencelist=('html', 'plain'))
+        body = email_message.get_body(preferencelist=("html", "plain"))
         content_type = "text"
-        if body.get_content_type() == 'text/html':
+        if body.get_content_type() == "text/html":
             # get content from html body
             body_content = body.get_content()
             content_type = "html"
@@ -94,7 +125,7 @@ class MicrosoftGraphHandler():
             else:
                 # assume other Content-Transfer-Encoding can be handled with get_content (E.g. "quoted-printable" or "base64")
                 body_content = body.get_content()
-               
+
         if email_message.is_multipart():
             for part in email_message.walk():
                 if part.get_content_maintype() == "multipart":
@@ -110,8 +141,7 @@ class MicrosoftGraphHandler():
                 else:
                     file_data = part.get_payload(decode=True)
                     if file_data:
-                        base64_encoded = base64.b64encode(
-                            file_data).decode("utf-8")
+                        base64_encoded = base64.b64encode(file_data).decode("utf-8")
                         attachment = {
                             "@odata.type": "#microsoft.graph.fileAttachment",
                             "name": get_attachment_filename(part),
@@ -123,12 +153,15 @@ class MicrosoftGraphHandler():
                             content_id = part.get("Content-ID", "").strip("<>")
                             if content_id:
                                 attachment["contentId"] = content_id.replace(
-                                    "@mydomain.com", "")
+                                    "@mydomain.com", ""
+                                )
                         attachments.append(attachment)
 
         return body_content, content_type, attachments
 
-    async def handle_DATA(self, server: SMTP, session: Session, envelope: Envelope) -> str:
+    async def handle_DATA(
+        self, server: SMTP, session: Session, envelope: Envelope
+    ) -> str:
         """
         Handles the SMTP DATA command, parses email content and attachments,
         and sends the email through Microsoft Graph API.
@@ -161,11 +194,14 @@ class MicrosoftGraphHandler():
             with open(f"./debug/{debug_hex}.email", "wb") as f:
                 f.write(envelope.content)
 
-        await event_bus_instance.publish('before_send', email_message)
+        await event_bus_instance.publish("before_send", email_message)
 
         # Extract body and attachments using helper method
-        body_content, content_type, attachments = MicrosoftGraphHandler._extract_body_and_attachments(
-            email_message, debug_hex)
+        body_content, content_type, attachments = (
+            MicrosoftGraphHandler._extract_body_and_attachments(
+                email_message, debug_hex
+            )
+        )
 
         # Build recipients from headers
         to_recipients = []
@@ -176,29 +212,34 @@ class MicrosoftGraphHandler():
                     part = part.strip()
                     if part:
                         recipient_list.extend(
-                            MicrosoftGraphHandler._extract_email_address(part))
+                            MicrosoftGraphHandler._extract_email_address(part)
+                        )
 
         # Determine bcc recipients from envelope.rcpt_tos that are not in To/Cc
-        parsed_to_cc = {r["emailAddress"]["address"]
-                        for r in to_recipients + cc_recipients}
+        parsed_to_cc = {
+            r["emailAddress"]["address"] for r in to_recipients + cc_recipients
+        }
         bcc_recipients = []
         for addr in envelope.rcpt_tos:
             for part in addr.split(","):
                 part = part.strip()
                 if part and part not in parsed_to_cc:
                     bcc_recipients.extend(
-                        MicrosoftGraphHandler._extract_email_address(part))
+                        MicrosoftGraphHandler._extract_email_address(part)
+                    )
 
-        await event_bus_instance.publish('sender', envelope.mail_from)
-        await event_bus_instance.publish('recipients', to_recipients, cc_recipients, bcc_recipients)
+        await event_bus_instance.publish("sender", envelope.mail_from)
+        await event_bus_instance.publish(
+            "recipients", to_recipients, cc_recipients, bcc_recipients
+        )
 
-        if (await event_bus_instance.publish('skip_send')):
+        if await event_bus_instance.publish("skip_send"):
             logging.info("Message accepted without delivery")
             return "250 Message accepted (delivery skipped)"
 
         # Acquire an access token
-        token_response = self.app.acquire_token_for_client(scopes=[".default"])
-        access_token = token_response.get("access_token")
+        access_token = await self._get_access_token()
+
         if not access_token:
             return "550 Failed to acquire access token"
 
@@ -230,21 +271,23 @@ class MicrosoftGraphHandler():
                 async with http_session.post(**send_payload) as response:
                     if response.status == 429:
                         return "421 Temporary error: Too many requests (429) from Graph API"
-                    elif response.status == 503:                        
+                    elif response.status == 503:
                         return "421 Temporary error: Service Unavailable (503) from Graph API"
-                    elif response.status == 504:                        
-                        return "421 Temporary error: Gateway Timeout (504) from Graph API"
+                    elif response.status == 504:
+                        return (
+                            "421 Temporary error: Gateway Timeout (504) from Graph API"
+                        )
                     elif response.status != 202:
                         error_text = await response.text()
                         return f"550 Error from Graph API ({response.status}): {error_text}"
 
         # Catch network errors and return a transient error 421 code
-        except aiohttp.ClientError as e:                            
+        except aiohttp.ClientError as e:
             return f"421 Network error while sending email: {e}"
 
         except Exception as e:
             return f"550 Exception sending email: {e}"
 
-        await event_bus_instance.publish('after_send')
+        await event_bus_instance.publish("after_send")
 
         return "250 Message accepted for delivery"

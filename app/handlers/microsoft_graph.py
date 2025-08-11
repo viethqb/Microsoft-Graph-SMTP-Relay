@@ -6,7 +6,7 @@ from email.message import Message
 from email.parser import Parser
 from email.utils import collapse_rfc2231_value, getaddresses
 from msal import ConfidentialClientApplication, TokenCache
-import aiohttp
+import requests  # Changed from aiohttp to requests
 import base64
 import os
 import uuid
@@ -58,7 +58,7 @@ class MicrosoftGraphHandler:
             "password": os.environ["PASSWORD"],
         }
 
-    async def _get_access_token(self):
+    def _get_access_token(self):
         """
         Gets an access token using the password grant flow.
 
@@ -66,19 +66,15 @@ class MicrosoftGraphHandler:
             str: The access token, or None if failed
         """
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.token_url, data=self.token_data
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data.get("access_token")
-                    else:
-                        error_text = await response.text()
-                        logging.error(
-                            f"Token request failed: {response.status} - {error_text}"
-                        )
-                        return None
+            response = requests.post(self.token_url, data=self.token_data)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("access_token")
+            else:
+                logging.error(
+                    f"Token request failed: {response.status_code} - {response.text}"
+                )
+                return None
         except Exception as e:
             logging.error(f"Exception getting token: {e}")
             return None
@@ -238,26 +234,27 @@ class MicrosoftGraphHandler:
             return "250 Message accepted (delivery skipped)"
 
         # Acquire an access token
-        access_token = await self._get_access_token()
+        access_token = self._get_access_token()  # Changed from async to sync
 
         if not access_token:
             return "550 Failed to acquire access token"
 
         # Build the send request payload for Microsoft Graph API
         send_payload = {
-            "url": f"https://graph.microsoft.com/v1.0/users/{envelope.mail_from}/sendMail",
-            "headers": {"Authorization": f"Bearer {access_token}"},
-            "json": {
-                "message": {
-                    "subject": email_message["Subject"],
-                    "body": {"contentType": content_type, "content": body_content},
-                    "toRecipients": to_recipients,
-                    "ccRecipients": cc_recipients,
-                    "bccRecipients": bcc_recipients,
-                    "attachments": attachments,
-                },
-                "saveToSentItems": os.environ.get("SAVE_TO_SENT", "true"),
+            "message": {
+                "subject": email_message["Subject"],
+                "body": {"contentType": content_type, "content": body_content},
+                "toRecipients": to_recipients,
+                "ccRecipients": cc_recipients,
+                "bccRecipients": bcc_recipients,
+                "attachments": attachments,
             },
+            "saveToSentItems": os.environ.get("SAVE_TO_SENT", "true"),
+        }
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
         }
 
         # Optionally log the payload if in DEBUG mode
@@ -267,22 +264,23 @@ class MicrosoftGraphHandler:
 
         # Send the email via Microsoft Graph API
         try:
-            async with aiohttp.ClientSession() as http_session:
-                async with http_session.post(**send_payload) as response:
-                    if response.status == 429:
-                        return "421 Temporary error: Too many requests (429) from Graph API"
-                    elif response.status == 503:
-                        return "421 Temporary error: Service Unavailable (503) from Graph API"
-                    elif response.status == 504:
-                        return (
-                            "421 Temporary error: Gateway Timeout (504) from Graph API"
-                        )
-                    elif response.status != 202:
-                        error_text = await response.text()
-                        return f"550 Error from Graph API ({response.status}): {error_text}"
+            response = requests.post(
+                f"https://graph.microsoft.com/v1.0/me/sendMail",
+                headers=headers,
+                json=send_payload
+            )
+            
+            if response.status_code == 429:
+                return "421 Temporary error: Too many requests (429) from Graph API"
+            elif response.status_code == 503:
+                return "421 Temporary error: Service Unavailable (503) from Graph API"
+            elif response.status_code == 504:
+                return "421 Temporary error: Gateway Timeout (504) from Graph API"
+            elif response.status_code != 202:
+                return f"550 Error from Graph API ({response.status_code}): {response.text}"
 
         # Catch network errors and return a transient error 421 code
-        except aiohttp.ClientError as e:
+        except requests.exceptions.RequestException as e:
             return f"421 Network error while sending email: {e}"
 
         except Exception as e:
